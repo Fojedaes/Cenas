@@ -1,5 +1,5 @@
 // Service worker de Cenas de la semana
-const VERSION = 'cenas-v1';
+const VERSION = 'cenas-v2';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icons/icon-192.png', './icons/icon-512.png', './icons/maskable-512.png', './icons/apple-touch-icon.png'];
 const FONTS = 'cenas-fonts';
 
