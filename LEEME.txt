@@ -1,0 +1,6 @@
+CENAS DE LA SEMANA - PWA
+
+Sube TODO el contenido de esta carpeta (index.html, manifest.webmanifest, sw.js y la carpeta icons)
+a un alojamiento con HTTPS, en la raíz o en una subcarpeta. Sin HTTPS no se puede instalar.
+
+Para actualizar la app más adelante: sustituye index.html y, en sw.js, cambia VERSION ('cenas-v1' -> 'cenas-v2').
