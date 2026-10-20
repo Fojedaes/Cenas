@@ -1,6 +1,6 @@
 CENAS DE LA SEMANA - PWA
 
-Sube TODO el contenido de esta carpeta (index.html, manifest.webmanifest, sw.js y la carpeta icons)
-a un alojamiento con HTTPS, en la raíz o en una subcarpeta. Sin HTTPS no se puede instalar.
+Sube a GitHub (en la raíz del repositorio) index.html, manifest.webmanifest, sw.js y la carpeta icons.
+NO subas a GitHub el archivo Codigo.gs: contiene la clave de vuestro plan compartido.
 
-Para actualizar la app más adelante: sustituye index.html y, en sw.js, cambia VERSION ('cenas-v2' -> 'cenas-v3').
+Para publicar una versión nueva más adelante: sustituye index.html y, en sw.js, cambia VERSION ('cenas-v3' -> 'cenas-v4').

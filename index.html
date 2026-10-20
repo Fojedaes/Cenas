@@ -281,6 +281,7 @@ table.nut tr:last-child td{border-bottom:0}
 
 #sheet .seg button{font-size:.85rem;line-height:1.2;padding:4px 2px}
 .dayname{min-height:44px}
+.syncok{color:var(--ok);font-weight:700}.syncwarn{color:var(--warn);font-weight:700}
 </style>
 </head>
 <body>
@@ -729,6 +730,200 @@ const comp = id => id ? (CBASE[id] || S.custom.comps[id] || null) : null;
 const ingOf = k => ING[k] || S.custom.ing[k];
 const allComps = () => [...COMPS, ...Object.values(S.custom.comps)];
 
+
+/* ---------- Sincronización entre móviles (base compartida del artefacto) ---------- */
+const SYNC = { kind: null, gas: null, db: null, state: 'local', canWrite: true, readOnly: false, gotCfg: false, gotWeeks: false, seeded: false, remoteCfg: null, remoteWeeks: {}, pending: {}, busy: {} };
+const isObj = o => o && typeof o === 'object' && !Array.isArray(o);
+function deepMerge(a, b){ const out = isObj(a) ? Object.assign({}, a) : {}; for (const [k, v] of Object.entries(b || {})) out[k] = isObj(v) && isObj(out[k]) ? deepMerge(out[k], v) : v; return out; }
+const weekOf = dk => ymd(mondayOf(parseYmd(dk)));
+function patchFor(ch){
+  const P = {};
+  const add = (path, patch) => { P[path] = deepMerge(P[path], patch); };
+  (ch.days || []).forEach(dk => add('semanas/' + weekOf(dk), { plan: { [dk]: S.plan[dk] || null } }));
+  (ch.diners || []).forEach(dk => add('semanas/' + weekOf(dk), { diners: { [dk]: S.diners[dk] || null } }));
+  if (ch.checked) for (const [wk, keys] of Object.entries(ch.checked)) keys.forEach(k => add('semanas/' + wk, { checked: { [k]: !!(S.checked[wk] && S.checked[wk][k]) } }));
+  (ch.template || []).forEach(d => add('hogar/config', { template: { [d]: S.template[d] } }));
+  (ch.comps || []).forEach(id => add('hogar/config', { custom: { comps: { [id]: S.custom.comps[id] || null } } }));
+  (ch.ings || []).forEach(k => add('hogar/config', { custom: { ing: { [k]: S.custom.ing[k] || null } } }));
+  return P;
+}
+function fullPatches(){
+  const rc = (SYNC.remoteCfg && SYNC.remoteCfg.custom) || {};
+  const comps = {}, ings = {};
+  Object.keys(rc.comps || {}).forEach(k => comps[k] = null); Object.keys(rc.ing || {}).forEach(k => ings[k] = null);
+  Object.assign(comps, S.custom.comps); Object.assign(ings, S.custom.ing);
+  const P = { 'hogar/config': { v: 2, template: S.template, custom: { comps, ing: ings } } };
+  const weeks = new Set([...Object.keys(S.plan).map(weekOf), ...Object.keys(S.diners).map(weekOf), ...Object.keys(S.checked), ...Object.keys(SYNC.remoteWeeks)]);
+  weeks.forEach(wk => {
+    const plan = {}, diners = {}, checked = {};
+    weekDates(wk).forEach(d => { const k = ymd(d); plan[k] = S.plan[k] || null; diners[k] = S.diners[k] || null; });
+    const rc = (SYNC.remoteWeeks[wk] && SYNC.remoteWeeks[wk].checked) || {}; Object.keys(rc).forEach(k => checked[k] = false);
+    Object.assign(checked, S.checked[wk] || {});
+    P['semanas/' + wk] = { plan, diners, checked };
+  });
+  return P;
+}
+function push(ch){
+  save();
+  if (!SYNC.kind || SYNC.readOnly) return;
+  const P = ch === 'all' ? fullPatches() : patchFor(ch);
+  for (const [path, patch] of Object.entries(P)) SYNC.pending[path] = deepMerge(SYNC.pending[path], patch);
+  savePending();
+  if (SYNC.kind === 'gas') gasFlushSoon(); else Object.keys(P).forEach(flush);
+}
+const PENDING_KEY = 'cenas-v2-pendiente', SYNC_CFG_KEY = 'cenas-v2-sync';
+function savePending(){ try { localStorage.setItem(PENDING_KEY, JSON.stringify(SYNC.pending)); } catch(e){} }
+function loadPending(){ try { const p = JSON.parse(localStorage.getItem(PENDING_KEY) || '{}'); if (isObj(p)) SYNC.pending = p; } catch(e){} }
+
+/* --- Servicio propio en Google Apps Script --- */
+function gasCfg(){ try { const c = JSON.parse(localStorage.getItem(SYNC_CFG_KEY) || 'null'); return c && (/^https:\/\/script\.google\.com\//.test(c.u) || /^http:\/\/localhost:\d+\//.test(c.u)) && typeof c.k === 'string' && c.k.length >= 16 ? c : null; } catch(e){ return null; } }
+function setGasCfg(c){ try { if (c) localStorage.setItem(SYNC_CFG_KEY, JSON.stringify(c)); else localStorage.removeItem(SYNC_CFG_KEY); } catch(e){} }
+let gasTimer = null, gasFlushT = null, gasInFlight = false;
+async function gasCall(body){
+  const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 20000);
+  try {
+    const r = body ? await fetch(SYNC.gas.u, { method: 'POST', body: JSON.stringify(Object.assign({ key: SYNC.gas.k }, body)), signal: ctl.signal, redirect: 'follow' })
+                   : await fetch(SYNC.gas.u + (SYNC.gas.u.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(SYNC.gas.k) + '&since=' + (SYNC.rev ?? -1) + '&t=' + Date.now(), { signal: ctl.signal, cache: 'no-store', redirect: 'follow' });
+    const j = await r.json();
+    if (j && j.error) throw { code: j.error };
+    return j;
+  } finally { clearTimeout(t); }
+}
+function gasHandle(j){
+  if (!j || j.same) return;
+  SYNC.rev = j.rev;
+  const docs = j.docs || {};
+  SYNC.remoteCfg = docs['hogar/config'] || null;
+  SYNC.remoteWeeks = {}; Object.entries(docs).forEach(([k, v]) => { if (k.startsWith('semanas/')) SYNC.remoteWeeks[k.slice(8)] = v; });
+  SYNC.gotCfg = SYNC.gotWeeks = true;
+  SYNC.seeded ? applyRemote() : maybeSeed();
+}
+async function gasPoll(){
+  if (!SYNC.gas || gasInFlight) return;
+  if (Object.keys(SYNC.pending).length) return gasFlush();
+  gasInFlight = true;
+  try { const j = await gasCall(null); gasHandle(j); if (SYNC.state !== 'synced'){ SYNC.state = 'synced'; refreshSoon(); } }
+  catch(e){ gasFail(e); }
+  finally { gasInFlight = false; }
+}
+function gasFlushSoon(){ clearTimeout(gasFlushT); gasFlushT = setTimeout(gasFlush, 400); }
+async function gasFlush(){
+  if (!SYNC.gas) return;
+  if (gasInFlight){ gasFlushSoon(); return; }
+  const sent = SYNC.pending; if (!Object.keys(sent).length) return;
+  SYNC.pending = {}; gasInFlight = true;
+  try { const j = await gasCall({ op: 'patch', patches: sent }); savePending(); SYNC.rev = null; gasHandle(j); SYNC.state = 'synced'; refreshSoon(); }
+  catch(e){ for (const [p, v] of Object.entries(sent)) SYNC.pending[p] = deepMerge(v, SYNC.pending[p]); savePending(); gasFail(e); }
+  finally { gasInFlight = false; if (Object.keys(SYNC.pending).length && SYNC.state === 'synced') gasFlushSoon(); }
+}
+function gasFail(e){
+  const code = e && e.code;
+  SYNC.state = code === 'key' ? 'badkey' : code === 'full' ? 'full' : 'error';
+  refreshSoon();
+}
+function startGas(c){
+  SYNC.kind = 'gas'; SYNC.gas = c; SYNC.state = 'connecting'; SYNC.seeded = false; SYNC.rev = null; loadPending(); refreshSoon();
+  gasPoll();
+  clearInterval(gasTimer); gasTimer = setInterval(() => { if (document.visibilityState === 'visible') gasPoll(); }, 12000);
+}
+window.addEventListener('online', () => { if (SYNC.kind === 'gas') gasPoll(); });
+function stopGas(){ clearInterval(gasTimer); SYNC.kind = null; SYNC.gas = null; SYNC.state = 'local'; SYNC.pending = {}; savePending(); setGasCfg(null); }
+function inviteLink(){ const c = SYNC.gas; return location.origin + location.pathname + '#sync=' + encodeURIComponent(btoa(unescape(encodeURIComponent(JSON.stringify({ u: c.u, k: c.k }))))); }
+function readInviteHash(){
+  const m = location.hash.match(/#sync=([^&]+)/); if (!m) return null;
+  try { const c = JSON.parse(decodeURIComponent(escape(atob(decodeURIComponent(m[1]))))); history.replaceState(null, '', location.pathname + location.search); return c; } catch(e){ return null; }
+}
+async function flush(path){
+  if (SYNC.kind !== 'db' || SYNC.busy[path] || !SYNC.pending[path]) return;
+  SYNC.busy[path] = true;
+  const patch = SYNC.pending[path]; delete SYNC.pending[path]; savePending();
+  const ref = SYNC.db.doc(path);
+  try {
+    try { await ref.update(patch); }
+    catch(e){
+      if (e && e.code === 'invalid_argument'){ const snap = await ref.get(); if (snap.exists) throw e; await ref.set(patch); }
+      else if (e && e.code === 'unavailable'){ await new Promise(r => setTimeout(r, 400 + Math.random() * 800)); await ref.update(patch).catch(async () => { await ref.set(deepMerge((await ref.get()).data(), patch)); }); }
+      else throw e;
+    }
+    if (SYNC.state !== 'synced'){ SYNC.state = 'synced'; refreshSoon(); }
+  } catch(e){
+    if (e && e.code === 'invalid_argument'){ SYNC.readOnly = true; SYNC.state = 'readonly'; toast('No tienes permiso para cambiar el plan compartido: tus cambios no se guardan.'); }
+    else if (e && e.code === 'quota_exceeded'){ SYNC.state = 'error'; toast('La base compartida está llena. Borra semanas antiguas o platos que no uséis.'); }
+    else { SYNC.state = 'error'; SYNC.pending[path] = deepMerge(patch, SYNC.pending[path]); }
+    refreshSoon();
+  } finally {
+    SYNC.busy[path] = false;
+    if (SYNC.pending[path] && !SYNC.readOnly && SYNC.state !== 'error') flush(path);
+  }
+}
+function applyRemote(){
+  const cfg = deepMerge(SYNC.remoteCfg || {}, SYNC.pending['hogar/config'] || {});
+  const plan = {}, diners = {}, checked = {};
+  for (const [wk, raw] of Object.entries(SYNC.remoteWeeks)){
+    const w = deepMerge(raw, SYNC.pending['semanas/' + wk] || {});
+    Object.assign(plan, w.plan || {}); Object.assign(diners, w.diners || {});
+    if (w.checked) checked[wk] = Object.fromEntries(Object.entries(w.checked).filter(([, v]) => v));
+  }
+  for (const [path, p] of Object.entries(SYNC.pending)) if (path.startsWith('semanas/') && !SYNC.remoteWeeks[path.slice(8)]){ Object.assign(plan, p.plan || {}); Object.assign(diners, p.diners || {}); }
+  const next = sanitize({ v: 2, settings: S.settings, template: cfg.template || S.template, custom: cfg.custom || { comps: {}, ing: {} }, plan, diners, checked });
+  next.settings = S.settings;
+  S = next; save(); refreshSoon();
+}
+let refreshT = null;
+function refreshSoon(){
+  clearTimeout(refreshT);
+  refreshT = setTimeout(() => {
+    const a = document.activeElement;
+    if (a && a.closest && a.closest('#app') && /INPUT|TEXTAREA|SELECT/.test(a.tagName)){ a.addEventListener('blur', refreshSoon, { once: true }); return; }
+    render(true);
+    const top = topSheet(); if (top && ['recipe','overview'].includes(top.kind)) paintSheet(false);
+  }, 60);
+}
+function maybeSeed(){
+  if (SYNC.seeded || !SYNC.gotCfg || !SYNC.gotWeeks) return;
+  SYNC.seeded = true;
+  const empty = !SYNC.remoteCfg && !Object.keys(SYNC.remoteWeeks).length;
+  if (empty){ if (SYNC.canWrite) push('all'); }
+  else applyRemote();
+  SYNC.state = SYNC.readOnly ? 'readonly' : 'synced'; refreshSoon();
+}
+async function startSync(){
+  const inv = readInviteHash();
+  if (inv){ setGasCfg(inv); toast('Móvil conectado al plan compartido'); }
+  if (!(window.claude && typeof window.claude.use === 'function')){ const c = gasCfg(); if (c) startGas(c); return; }
+  let db = null, user = null;
+  try { [db, user] = await Promise.all([window.claude.use('db'), window.claude.use('user')]); } catch(e){ return; }
+  if (!db){ const c = gasCfg(); if (c) startGas(c); return; }
+  SYNC.kind = 'db'; SYNC.db = db; SYNC.state = 'connecting'; refreshSoon();
+  try { const w = user ? await user.can('data.write') : null; if (w === false){ SYNC.canWrite = false; SYNC.readOnly = true; } } catch(e){}
+  const onErr = e => { SYNC.state = e && e.code === 'revoked' ? 'local' : 'error'; if (e && e.code === 'revoked'){ SYNC.db = null; SYNC.kind = null; } refreshSoon(); };
+  db.doc('hogar/config').onSnapshot(snap => {
+    SYNC.remoteCfg = snap.exists ? snap.data() : null;
+    if (!snap.metadata || !snap.metadata.fromCache) SYNC.gotCfg = true;
+    SYNC.seeded ? applyRemote() : maybeSeed();
+  }, onErr);
+  db.collection('semanas').onSnapshot(qs => {
+    const m = {}; qs.docs.forEach(d => { if (d.exists) m[d.id] = d.data(); }); SYNC.remoteWeeks = m;
+    if (!qs.metadata || !qs.metadata.fromCache) SYNC.gotWeeks = true;
+    SYNC.seeded ? applyRemote() : maybeSeed();
+  }, onErr);
+}
+const MUTATING = new Set(['who','saveday','dayreset','vary','resetweek','check','uncheck','delcomp','savecomp','tmode','trem','doimport','wipe']);
+function syncCard(){
+  if (SYNC.kind === 'db') return '<p class="small muted" style="margin:6px 0 0">El plan, la plantilla, los platos propios y la lista de la compra se comparten con quien tenga acceso a esta app en claude.ai.</p>';
+  if (SYNC.kind === 'gas') return `<p class="small muted" style="margin:6px 0 10px">Se comparte el plan, la plantilla, los platos propios y la lista de la compra. Las preferencias de esta pantalla son solo tuyas.</p>
+    <div class="actions" style="margin-top:0"><button class="btn primary" data-act="invite">${ICON.share}Enviar enlace al otro móvil</button><button class="btn" data-act="syncnow">Sincronizar ahora</button></div>
+    <p style="margin:10px 0 0"><button class="linkbtn small" data-act="unsync">Desconectar este móvil</button></p>`;
+  return `<p class="small muted" style="margin:6px 0 6px">Para compartir el plan entre dos móviles, pega aquí la dirección y la clave de tu script de Google. Si te han enviado un enlace de invitación, basta con pegarlo en el primer campo.</p>
+    <label class="field"><span>Dirección del script (o el enlace de invitación que te enviaron)</span><input id="gas-u" inputmode="url" autocomplete="off" placeholder="https://script.google.com/macros/s/…/exec"></label>
+    <label class="field"><span>Clave</span><input id="gas-k" autocomplete="off" placeholder="La clave que está en el script"></label>
+    <div id="gas-err" class="errtxt" role="alert"></div>
+    <button class="btn primary full" data-act="connect">Conectar</button>`;
+}
+function syncLabel(){
+  return { local: 'Solo en este móvil', connecting: 'Conectando con el plan compartido…', synced: 'Compartido: los cambios se ven en los dos móviles', readonly: 'Solo lectura: puedes ver el plan, pero no cambiarlo', error: 'Sin conexión con el plan compartido. Tus cambios se guardan aquí y se enviarán al recuperar la conexión.', badkey: 'La clave no coincide con la del script de Google. Revisa la dirección y la clave.', full: 'El almacén compartido está lleno.' }[SYNC.state];
+}
+
 /* ---------- Fechas ---------- */
 const ymd = d => d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
 const parseYmd = s => { const [y,m,d] = s.split('-').map(Number); return new Date(y, m-1, d); };
@@ -881,7 +1076,7 @@ function weekNav(){
     <h1>${weekTitle(curWeek)}</h1>
     <button class="iconbtn" data-act="wk" data-d="1" aria-label="Semana siguiente">${ICON.right}</button>
   </div>
-  <div class="sub small muted"><span>${relWeek(curWeek)}</span>${curWeek !== curMonday() ? '<button class="linkbtn small" data-act="wkdef">Ir a esta semana</button>' : ''}<button class="linkbtn small" data-act="overview">Ver varias semanas</button></div>`;
+  <div class="sub small muted"><span>${relWeek(curWeek)}</span>${SYNC.state === 'synced' ? '<span class="syncok">Compartido</span>' : SYNC.state === 'readonly' ? '<span class="syncwarn">Solo lectura</span>' : ['error','badkey','full'].includes(SYNC.state) ? '<button class="linkbtn small syncwarn" data-act="tab" data-v="settings">Sin sincronizar</button>' : ''}${curWeek !== curMonday() ? '<button class="linkbtn small" data-act="wkdef">Ir a esta semana</button>' : ''}<button class="linkbtn small" data-act="overview">Ver varias semanas</button></div>`;
 }
 
 /* ---------- Vista: plan ---------- */
@@ -989,7 +1184,9 @@ function itemTitle(t, it){ return t.mode === 'dish' ? (comp(it.d) ? comp(it.d).n
 function renderSettings(){
   const sw = (k, l, d) => `<button class="row swrow" role="switch" aria-checked="${!!S.settings[k]}" data-act="set" data-k="${k}"><span><b>${l}</b>${d ? `<br><span class="small muted">${d}</span>` : ''}</span><span class="switch" aria-hidden="true"></span></button>`;
   return `<h1 style="margin:6px 0 6px">Ajustes</h1>
-  <h2 class="section" style="margin-top:12px">Plantilla semanal</h2>
+  <h2 class="section" style="margin-top:12px">Sincronización</h2>
+  <div class="card"><p style="margin:0"><b class="${SYNC.state === 'synced' ? 'syncok' : SYNC.state === 'local' || SYNC.state === 'connecting' ? '' : 'syncwarn'}">${syncLabel()}</b></p>${syncCard()}</div>
+  <h2 class="section">Plantilla semanal</h2>
   <p class="small muted" style="margin:4px 0 12px">Cada semana sin planificar se rellena con esto. Las combinaciones de cada día rotan en orden. Para añadir una, elígela en un día del plan y marca "Añadir a la rotación".</p>
   ${[0,1,2,3,4,5,6].map(d => { const t = S.template[d];
     return `<div class="card"><h3>${DAYS[d]}</h3>
@@ -1006,7 +1203,7 @@ function renderSettings(){
     <p><b>Judith.</b> Su ración es aproximadamente un 60 % de la proteína de Fran, con algo más de hidrato. Es una estimación de mantenimiento, no una medición.</p>
     <p><b>Valores.</b> Salen de tablas estándar (BEDCA y USDA) sobre el peso en crudo. Pueden variar un 10 % o más según la marca y la pieza. En los platos que añadáis vosotros, solo se calculan si se conocen los valores de todos los ingredientes.</p>
     <p><b>Sin huevo.</b> Ninguna receta lleva huevo; la IA también tiene esa instrucción.</p></details>
-  <div class="card"><div class="row"><span><b>Borrar mis datos</b><br><span class="small muted">Vuelve al plan del Excel y a la plantilla inicial</span></span><button class="btn small" data-act="wipe">Borrar</button></div></div>`;
+  <div class="card"><div class="row"><span><b>${SYNC.kind ? 'Reiniciar el plan compartido' : 'Borrar mis datos'}</b><br><span class="small muted">Vuelve al plan del Excel y a la plantilla inicial${SYNC.kind ? ', en los dos móviles' : ''}</span></span><button class="btn small" data-act="wipe">${SYNC.kind ? 'Reiniciar' : 'Borrar'}</button></div></div>`;
 }
 
 function render(keep){
@@ -1222,7 +1419,7 @@ function saveComp(){
   const c = { id, kind: f.kind, name: f.name, label: (f.kind === 'v' || f.kind === 'h') ? (f.label.trim() || lc(f.name)) : undefined, group: f.kind === 'p' ? f.group : undefined,
     active: Math.round(f.active) || 10, total: Math.round(f.total) || Math.round(f.active) || 10, equip: f.equip.filter(e => EQUIP[e]), ing, spices: [], steps: parsed, tips: f.tips.split('\n').map(s => s.trim()).filter(Boolean), source: f.source || 'manual' };
   if (f.nut) c.nut = f.nut;
-  S.custom.comps[id] = c; save();
+  S.custom.comps[id] = c; push({ comps: [id], ings: ing.map(r => r[0]).filter(k => k.startsWith('x-')) });
   const back = topSheet().ctx.returnTo;
   sheetStack.pop();
   if (back && back.kind === 'edit'){ const t = topSheet(); if (t && t.kind === 'edit'){ if (c.kind === 'd'){ t.ctx.draft = { type: 'dish', d: id }; } else { if (t.ctx.draft.type !== 'combo') t.ctx.draft = { type: 'combo', p: null, v: null, h: null }; t.ctx.draft[c.kind] = id; } } }
@@ -1302,7 +1499,7 @@ function paintTimers(){ $('#timers').innerHTML = timers.map(t => `<div class="ti
 let wakeLock = null;
 async function setWake(on){ try { if (on && 'wakeLock' in navigator){ wakeLock = await navigator.wakeLock.request('screen'); return true; } if (!on && wakeLock){ await wakeLock.release(); wakeLock = null; } } catch(e){ wakeLock = null; } return false; }
 async function copyText(text){
-  try { if (navigator.clipboard && window.isSecureContext){ await navigator.clipboard.writeText(text); return true; } } catch(e){}
+  try { if (navigator.clipboard && window.isSecureContext){ const ok = await Promise.race([navigator.clipboard.writeText(text).then(() => true), new Promise(r => setTimeout(() => r(false), 1500))]); if (ok) return true; } } catch(e){}
   try { const ta = document.createElement('textarea'); ta.value = text; ta.setAttribute('readonly', ''); ta.style.position = 'fixed'; ta.style.opacity = '0'; document.body.appendChild(ta); ta.select(); const ok = document.execCommand('copy'); ta.remove(); if (ok) return true; } catch(e){}
   return false;
 }
@@ -1311,13 +1508,14 @@ async function copyText(text){
 document.addEventListener('click', async ev => {
   const b = ev.target.closest('[data-act]'); if (!b || b.disabled) return;
   const a = b.dataset.act, top = topSheet(), ctx = top && top.ctx;
+  if (SYNC.readOnly && MUTATING.has(a)){ toast('Solo lectura: pide permiso de edición a quien te compartió la app.'); return; }
   switch (a){
     case 'tab': view = b.dataset.v; closeAll(); render(); break;
     case 'wk': curWeek = ymd(addDays(parseYmd(curWeek), 7 * Number(b.dataset.d))); render(); break;
     case 'wkdef': curWeek = curMonday(); render(); break;
     case 'overview': pushSheet('overview', {}); break;
     case 'gowk': curWeek = b.dataset.k; closeAll(); view = 'plan'; render(); break;
-    case 'who': { const dk = b.dataset.dk, p = +b.dataset.p; const c = diners(dk).slice(); c[p] = !c[p]; if (c[0] && c[1]) delete S.diners[dk]; else S.diners[dk] = c; save(); render(true); break; }
+    case 'who': { const dk = b.dataset.dk, p = +b.dataset.p; const c = diners(dk).slice(); c[p] = !c[p]; if (c[0] && c[1]) delete S.diners[dk]; else S.diners[dk] = c; push({ diners: [dk] }); render(true); break; }
     case 'open': openRecipeFor(b.dataset.dk); break;
     case 'edit': if (top && top.kind === 'recipe') sheetStack.pop(); openEdit(b.dataset.dk); break;
     case 'back': if (top && top.kind === 'ai' && aiCtl) aiCtl.abort(); if (top && top.kind === 'recipe' && ctx.big) setWake(false); popSheet(); break;
@@ -1338,17 +1536,17 @@ document.addEventListener('click', async ev => {
         if (t.mode !== want){ t.mode = want; t.list = []; }
         const item = want === 'dish' ? { d: e.d } : { p: e.p, v: e.v, h: e.h };
         if (!t.list.some(x => JSON.stringify(x) === JSON.stringify(item))) t.list.push(item); }
-      save(); closeAll(); render(true); toast(ctx.addRot ? 'Guardado y añadido a la rotación' : 'Cena guardada'); break;
+      push({ days: [ctx.dk], template: ctx.addRot ? [(parseYmd(ctx.dk).getDay() + 6) % 7] : [] }); closeAll(); render(true); toast(ctx.addRot ? 'Guardado y añadido a la rotación' : 'Cena guardada'); break;
     }
-    case 'dayreset': delete S.plan[ctx.dk]; save(); closeAll(); render(true); toast('Vuelve a la plantilla'); break;
+    case 'dayreset': delete S.plan[ctx.dk]; push({ days: [ctx.dk] }); closeAll(); render(true); toast('Vuelve a la plantilla'); break;
     case 'vary': {
-      let n = 0;
-      weekDates(curWeek).forEach(dt => { const dk = ymd(dt), e = entryFor(dk); if (e.type !== 'combo') return; S.plan[dk] = randomFor(e); n++; });
-      save(); render(true); toast(n ? `${n} combinaciones nuevas` : 'No hay combinaciones que variar esta semana'); break;
+      let n = 0; const ds = [];
+      weekDates(curWeek).forEach(dt => { const dk = ymd(dt), e = entryFor(dk); if (e.type !== 'combo') return; S.plan[dk] = randomFor(e); ds.push(dk); n++; });
+      push({ days: ds }); render(true); toast(n ? `${n} combinaciones nuevas` : 'No hay combinaciones que variar esta semana'); break;
     }
-    case 'resetweek': if (!confirm('Se sustituirán las cenas fijadas de esta semana por las de la plantilla. ¿Seguir?')) break; weekDates(curWeek).forEach(dt => delete S.plan[ymd(dt)]); save(); render(true); toast('Semana con la plantilla'); break;
-    case 'check': { const w = S.checked[curWeek] = S.checked[curWeek] || {}; const k = b.dataset.k; if (w[k]) delete w[k]; else w[k] = true; save(); render(true); break; }
-    case 'uncheck': S.checked[curWeek] = {}; save(); render(true); break;
+    case 'resetweek': if (!confirm('Se sustituirán las cenas fijadas de esta semana por las de la plantilla. ¿Seguir?')) break; weekDates(curWeek).forEach(dt => delete S.plan[ymd(dt)]); push({ days: weekDates(curWeek).map(ymd) }); render(true); toast('Semana con la plantilla'); break;
+    case 'check': { const w = S.checked[curWeek] = S.checked[curWeek] || {}; const k = b.dataset.k; if (w[k]) delete w[k]; else w[k] = true; push({ checked: { [curWeek]: [k] } }); render(true); break; }
+    case 'uncheck': { const ks = Object.keys(S.checked[curWeek] || {}); S.checked[curWeek] = {}; push({ checked: { [curWeek]: ks } }); render(true); break; }
     case 'copy': { const t = shopText(true); if (await copyText(t)) toast('Lista copiada'); else pushSheet('copy', { text: t }); break; }
     case 'share': { const t = shopText(true); try { if (navigator.share){ await navigator.share({ title: 'Lista de la compra', text: t }); break; } } catch(e){ if (e && e.name === 'AbortError') break; } if (await copyText(t)) toast('Lista copiada para pegar'); else pushSheet('copy', { text: t }); break; }
     case 'libkind': libKind = b.dataset.v; render(true); break;
@@ -1361,21 +1559,38 @@ document.addEventListener('click', async ev => {
     case 'delcomp': {
       const id = b.dataset.id; const used = Object.values(S.plan).some(e => [e.p, e.v, e.h, e.d].includes(id)) || Object.values(S.template).some(t => t.list.some(x => [x.p, x.v, x.h, x.d].includes(id)));
       if (!confirm(used ? 'Este plato está en el plan o en la plantilla. Si lo borras, esas cenas quedarán por decidir. ¿Borrarlo?' : '¿Borrar este plato?')) break;
-      delete S.custom.comps[id]; Object.values(S.template).forEach(t => t.list = t.list.filter(x => ![x.p, x.v, x.h, x.d].includes(id)));
-      for (const [k, e] of Object.entries(S.plan)) if (e.type === 'combo' && [e.p, e.v, e.h].includes(id)){ ['p','v','h'].forEach(s => { if (e[s] === id) e[s] = null; }); if (!e.p && !e.v && !e.h) S.plan[k] = { type: 'tbd', note: '' }; }
-      save(); closeAll(); render(true); toast('Plato borrado'); break;
+      delete S.custom.comps[id]; const tds = []; Object.entries(S.template).forEach(([d, t]) => { const n0 = t.list.length; t.list = t.list.filter(x => ![x.p, x.v, x.h, x.d].includes(id)); if (t.list.length !== n0) tds.push(d); });
+      const pds = []; for (const [k, e] of Object.entries(S.plan)) if (e.type === 'combo' && [e.p, e.v, e.h].includes(id)){ ['p','v','h'].forEach(s => { if (e[s] === id) e[s] = null; }); if (!e.p && !e.v && !e.h) S.plan[k] = { type: 'tbd', note: '' }; pds.push(k); }
+      push({ comps: [id], template: tds, days: pds }); closeAll(); render(true); toast('Plato borrado'); break;
     }
     case 'feq': { readForm(); const k = b.dataset.k, eq = ctx.form.equip; ctx.form.equip = eq.includes(k) ? eq.filter(x => x !== k) : [...eq, k]; paintSheet(); break; }
     case 'rowadd': { readForm(); ctx.form.rows.push({ name: '', F: '', J: '', a: 'des' }); paintSheet(); const inputs = document.querySelectorAll('#rows .ingrow [data-f="name"]'); if (inputs.length) inputs[inputs.length - 1].focus(); break; }
     case 'rowdel': { readForm(); const i = +b.closest('.ingrow').dataset.row; ctx.form.rows.splice(i, 1); paintSheet(); break; }
     case 'savecomp': saveComp(); break;
+    case 'connect': {
+      let u = $('#gas-u').value.trim(), k = $('#gas-k').value.trim(); const er = $('#gas-err');
+      const mm = u.match(/#sync=([^&\s]+)/);
+      if (mm){ try { const c = JSON.parse(decodeURIComponent(escape(atob(decodeURIComponent(mm[1]))))); u = c.u; k = c.k; } catch(e){ er.textContent = 'El enlace de invitación no es válido: pide que te lo vuelvan a enviar.'; break; } }
+      if (!/^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec$/.test(u) && !/^http:\/\/localhost:\d+\/macros\/s\/[^/]+\/exec$/.test(u)){ er.textContent = 'La dirección debe ser la del despliegue, terminada en /exec.'; break; }
+      if (k.length < 16){ er.textContent = 'La clave es demasiado corta: cópiala entera del script.'; break; }
+      b.disabled = true; b.textContent = 'Conectando…';
+      SYNC.gas = { u, k };
+      try { const j = await gasCall(null); setGasCfg({ u, k }); startGas({ u, k }); gasHandle(j); toast('Conectado'); render(true); }
+      catch(e){ SYNC.gas = null; er.textContent = e && e.code === 'key' ? 'La clave no coincide con la del script.' : 'No se ha podido conectar. Revisa la dirección y que el despliegue sea para "Cualquier usuario".'; b.disabled = false; b.textContent = 'Conectar'; }
+      break;
+    }
+    case 'invite': { const link = inviteLink(); const text = 'Abre este enlace en tu móvil para compartir el menú de cenas: ' + link;
+      try { if (navigator.share){ await navigator.share({ title: 'Cenas de la semana', text }); break; } } catch(e){ if (e && e.name === 'AbortError') break; }
+      if (await copyText(link)) toast('Enlace copiado: mándaselo por WhatsApp'); else pushSheet('copy', { text: link, title: 'Enlace para el otro móvil' }); break; }
+    case 'syncnow': gasPoll(); toast('Sincronizando…'); break;
+    case 'unsync': if (confirm('Este móvil dejará de compartir el plan (el otro seguirá conectado). ¿Seguir?')){ stopGas(); render(true); } break;
     case 'set': S.settings[b.dataset.k] = !S.settings[b.dataset.k]; save(); render(true); break;
-    case 'tmode': { const d = +b.dataset.d, t = S.template[d]; t.mode = b.dataset.v; if ((t.mode === 'combo' && t.list.some(x => x.d)) || (t.mode === 'dish' && t.list.some(x => !x.d))) t.list = t.list.filter(x => t.mode === 'dish' ? x.d : !x.d); save(); render(true); break; }
-    case 'trem': { const t = S.template[+b.dataset.d]; t.list.splice(+b.dataset.k, 1); save(); render(true); break; }
+    case 'tmode': { const d = +b.dataset.d, t = S.template[d]; t.mode = b.dataset.v; if ((t.mode === 'combo' && t.list.some(x => x.d)) || (t.mode === 'dish' && t.list.some(x => !x.d))) t.list = t.list.filter(x => t.mode === 'dish' ? x.d : !x.d); push({ template: [d] }); render(true); break; }
+    case 'trem': { const t = S.template[+b.dataset.d]; t.list.splice(+b.dataset.k, 1); push({ template: [+b.dataset.d] }); render(true); break; }
     case 'export': { const t = JSON.stringify(S); if (await copyText(t)) toast('Datos copiados: pégalos donde quieras guardarlos'); else pushSheet('copy', { text: t, title: 'Tus datos' }); break; }
     case 'import': pushSheet('import', {}); break;
-    case 'doimport': { let raw; try { raw = JSON.parse($('#impbox').value); } catch(e){ $('#imperr').textContent = 'Ese texto no son datos válidos de la app.'; break; } if (!raw || raw.v !== 2){ $('#imperr').textContent = 'Ese texto no son datos válidos de la app.'; break; } S = sanitize(raw); save(); closeAll(); render(); toast('Datos restaurados'); break; }
-    case 'wipe': if (confirm('¿Borrar tus cambios y volver al plan del Excel?')){ try { localStorage.removeItem(STORE_KEY); } catch(e){} load(); render(); toast('Datos borrados'); } break;
+    case 'doimport': { let raw; try { raw = JSON.parse($('#impbox').value); } catch(e){ $('#imperr').textContent = 'Ese texto no son datos válidos de la app.'; break; } if (!raw || raw.v !== 2){ $('#imperr').textContent = 'Ese texto no son datos válidos de la app.'; break; } S = sanitize(raw); push('all'); closeAll(); render(); toast('Datos restaurados'); break; }
+    case 'wipe': if (confirm(SYNC.kind ? '¿Reiniciar el plan compartido? Se perderán los cambios en los dos móviles.' : '¿Borrar tus cambios y volver al plan del Excel?')){ const keep = S.settings; try { localStorage.removeItem(STORE_KEY); } catch(e){} load(); S.settings = keep; push('all'); render(); toast(SYNC.kind ? 'Plan compartido reiniciado' : 'Datos borrados'); } break;
     case 'mode': ctx.mode = b.dataset.v; paintSheet(); break;
     case 'stepdone': { const k = b.dataset.k; ctx.done.has(k) ? ctx.done.delete(k) : ctx.done.add(k); paintSheet(); break; }
     case 'timer': { const c = comp(b.dataset.c), i = +b.dataset.i; startTimer(`${c.name}: paso ${i+1}`, c.steps[i][1]); break; }
@@ -1387,23 +1602,23 @@ document.addEventListener('click', async ev => {
 document.addEventListener('input', ev => {
   const t = ev.target;
   if (t.id === 'q'){ libQ = t.value; const el = $('#rlist'); if (el){ const tmp = document.createElement('div'); tmp.innerHTML = renderLib(); el.innerHTML = tmp.querySelector('#rlist').innerHTML; } }
-  if (t.dataset.tnote != null){ S.template[+t.dataset.tnote].note = t.value; save(); }
+  if (t.dataset.tnote != null){ S.template[+t.dataset.tnote].note = t.value; clearTimeout(t._tm); t._tm = setTimeout(() => push({ template: [+t.dataset.tnote] }), 600); }
   if (t.dataset.f === 'name'){ const row = t.closest('.ingrow'); const known = ING_NAMES()[t.value.trim().toLowerCase()]; row.querySelector('.aisle').hidden = !!known; }
 });
 document.addEventListener('change', ev => {
   if (ev.target.id === 'f-kind'){ readForm(); paintSheet(); }
 });
 document.addEventListener('keydown', ev => { if (ev.key === 'Escape' && sheetStack.length){ const top = topSheet(); if (top.kind === 'ai' && aiCtl) aiCtl.abort(); popSheet(); } });
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible'){ const top = topSheet(); if (top && top.kind === 'recipe' && top.ctx.big) setWake(true); } });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible'){ if (SYNC.kind === 'gas') gasPoll(); const top = topSheet(); if (top && top.kind === 'recipe' && top.ctx.big) setWake(true); } });
 
 /* ---------- Inicio ---------- */
-load(); render();
+load(); render(); startSync();
 try {
   if (window.claude && typeof window.claude.use === 'function'){
     window.claude.use('sample').then(fn => { if (fn && typeof fn.json === 'function'){ AI = fn; if (view === 'lib' && !sheetStack.length) render(true); } }).catch(() => {});
   }
 } catch(e){}
-window.__app = { entryFor, entryTitle, entryNut, shopping, shopText, buyText, weekDates, comp, get state(){ return S; }, get week(){ return curWeek; }, aiToForm, aiPrompt, templateEntry };
+window.__app = { SYNC, inviteLink, entryFor, entryTitle, entryNut, shopping, shopText, buyText, weekDates, comp, get state(){ return S; }, get week(){ return curWeek; }, aiToForm, aiPrompt, templateEntry };
 })();
 
 </script>
